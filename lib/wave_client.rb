@@ -6,9 +6,10 @@ require "json"
 class WaveClient
   ENDPOINT = "https://gql.waveapps.com/graphql/public"
 
-  def initialize(access_token:, business_id: nil)
+  def initialize(access_token:, business_id: nil, anchor_account_id: nil)
     @access_token = access_token
     @business_id = business_id
+    @anchor_account_id = anchor_account_id
   end
 
   def list_businesses
@@ -208,6 +209,49 @@ class WaveClient
     sent_result = result.dig("data", "invoiceMarkSent")
     raise_if_errors!(sent_result)
     sent_result["invoice"]
+  end
+
+  def receivable_account_ids
+    accounts = list_accounts
+    accounts
+      .select { |a| a.dig("subtype", "value") == "RECEIVABLE_INVOICES" }
+      .map { |a| a["id"] }
+  end
+
+  def record_payment(amount:, date:, description:, receivable_account_id:)
+    mutation = <<~GQL
+      mutation($input: MoneyTransactionCreateInput!) {
+        moneyTransactionCreate(input: $input) {
+          didSucceed
+          inputErrors { path message }
+          transaction { id }
+        }
+      }
+    GQL
+
+    input = {
+      businessId: @business_id,
+      externalId: "remote-pay-#{description.gsub(/\s+/, "-")}",
+      date: date,
+      description: description,
+      anchor: {
+        accountId: @anchor_account_id,
+        amount: amount.to_s,
+        direction: "DEPOSIT"
+      },
+      lineItems: [
+        {
+          accountId: receivable_account_id,
+          amount: amount.to_s,
+          balance: "CREDIT"
+        }
+      ]
+    }
+
+    result = execute(mutation, input: input)
+    tx_result = result.dig("data", "moneyTransactionCreate")
+    raise_if_errors!(tx_result)
+    tx_result["transaction"]
   end
 
   private

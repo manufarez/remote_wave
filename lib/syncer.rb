@@ -49,17 +49,36 @@ class Syncer
       return
     end
 
+    label = "##{inv_num} #{name} - #{amount} EUR on #{date}"
+
+    before_ids = @wave.receivable_account_ids
+
     wave_invoice = @wave.create_invoice(
       customer_id: customer["id"],
       items: [{ product_id: @product_id, description: invoice[:description], amount: amount }],
       date: date,
       invoice_number: inv_num
     )
+    puts "  [INVOICE] #{label} -> created"
 
     @wave.approve_invoice(wave_invoice["id"])
     @wave.mark_invoice_sent(wave_invoice["id"])
+    puts "  [INVOICE] #{label} -> approved & sent"
 
-    puts "  [SYNCED] ##{inv_num} - #{amount} EUR on #{date}"
+    after_ids = @wave.receivable_account_ids
+    new_ids = after_ids - before_ids
+
+    if new_ids.length == 1
+      @wave.record_payment(
+        amount: amount,
+        date: date,
+        description: "Payment from #{name} via Remote.com - Invoice ##{inv_num}",
+        receivable_account_id: new_ids.first
+      )
+      puts "  [PAYMENT] #{label} -> recorded"
+    else
+      puts "  [WARNING] #{label} -> payment not recorded (could not identify receivable account)"
+    end
     results[:synced] << invoice
   rescue StandardError => e
     puts "  [ERROR] ##{inv_num} #{name} - #{e.message}"

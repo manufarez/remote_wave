@@ -49,6 +49,27 @@ class CLI < Thor
     end
   end
 
+  desc "debug_accounts", "List receivable invoice accounts (for debugging)"
+  def debug_accounts
+    token = ENV.fetch("WAVE_ACCESS_TOKEN")
+    biz_id = ENV.fetch("WAVE_BUSINESS_ID")
+    wave = WaveClient.new(access_token: token, business_id: biz_id)
+
+    accounts = wave.list_accounts
+    receivables = accounts.select { |a| a.dig("subtype", "value")&.include?("RECEIVABLE") }
+
+    if receivables.any?
+      puts "=== Receivable Accounts ==="
+      receivables.each do |acc|
+        puts "  #{acc["name"]} | type=#{acc.dig("type", "value")} subtype=#{acc.dig("subtype", "value")} | id=#{acc["id"]}"
+      end
+    else
+      puts "No receivable accounts found."
+      puts "\nAll account subtypes:"
+      accounts.map { |a| a.dig("subtype", "value") }.uniq.compact.sort.each { |s| puts "  #{s}" }
+    end
+  end
+
   desc "run_sync", "Sync paid invoices from Remote.com CSV export to Wave"
   option :csv, type: :string, required: true, desc: "Path to Remote.com contractor invoices CSV export"
   option :since, type: :string, desc: "Only sync invoices after this date (YYYY-MM-DD)"
@@ -62,7 +83,8 @@ class CLI < Thor
 
     wave = WaveClient.new(
       access_token: ENV.fetch("WAVE_ACCESS_TOKEN"),
-      business_id: ENV.fetch("WAVE_BUSINESS_ID")
+      business_id: ENV.fetch("WAVE_BUSINESS_ID"),
+      anchor_account_id: ENV.fetch("WAVE_ANCHOR_ACCOUNT_ID")
     )
 
     product_id = ENV.fetch("WAVE_PRODUCT_ID")
@@ -79,7 +101,7 @@ class CLI < Thor
   private
 
   def validate_env!
-    required = %w[WAVE_ACCESS_TOKEN WAVE_BUSINESS_ID WAVE_PRODUCT_ID]
+    required = %w[WAVE_ACCESS_TOKEN WAVE_BUSINESS_ID WAVE_ANCHOR_ACCOUNT_ID WAVE_PRODUCT_ID]
     missing = required.select { |key| ENV[key].nil? || ENV[key].empty? }
 
     return if missing.empty?

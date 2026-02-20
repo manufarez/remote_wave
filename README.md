@@ -1,6 +1,6 @@
 # Remote.com to Wave invoice sync
 
-Ruby CLI that reads paid invoices from a Remote.com CSV export and creates matching invoices in Wave accounting.
+Ruby CLI that reads paid invoices from a Remote.com CSV export and creates matching invoices in Wave accounting, with automatic payment recording.
 
 ## What it does
 
@@ -10,8 +10,7 @@ For each paid invoice in the CSV, the script:
 2. Skips if the invoice already exists in Wave (by invoice number)
 3. Creates the invoice in Wave with the Remote invoice number
 4. Approves and marks it as sent
-
-Payments are not recorded automatically (Wave's API doesn't support linking payments to invoices). Record payments manually in Wave when bank transactions are imported.
+5. Records the payment against the invoice (marks it as paid)
 
 ## Setup
 
@@ -34,16 +33,17 @@ Create a `.env` file:
 ```
 WAVE_ACCESS_TOKEN=...
 WAVE_BUSINESS_ID=...
+WAVE_ANCHOR_ACCOUNT_ID=...
 WAVE_PRODUCT_ID=...
 ```
 
-To find your business ID and product ID, set `WAVE_ACCESS_TOKEN` first, then run:
+To find your IDs, set `WAVE_ACCESS_TOKEN` first, then run:
 
 ```
 bin/sync setup
 ```
 
-This will list your Wave businesses, accounts, and products with their IDs.
+This will list your Wave businesses, bank accounts, and products with their IDs.
 
 ## Usage
 
