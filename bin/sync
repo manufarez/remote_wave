@@ -1,0 +1,101 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "bundler/setup"
+require "dotenv/load"
+require "thor"
+
+require_relative "../lib/remote_client"
+require_relative "../lib/wave_client"
+require_relative "../lib/syncer"
+
+class CLI < Thor
+  default_command :run_sync
+
+  desc "setup", "Find your Wave business ID and account IDs"
+  def setup
+    token = ENV["WAVE_ACCESS_TOKEN"]
+    if token.nil? || token.empty?
+      puts "Set WAVE_ACCESS_TOKEN in .env first (Full Access Token from developer.waveapps.com)"
+      exit 1
+    end
+
+    wave = WaveClient.new(access_token: token)
+
+    puts "=== Your Wave Businesses ==="
+    businesses = wave.list_businesses
+    businesses.each do |biz|
+      puts "  #{biz["name"]} → WAVE_BUSINESS_ID=#{biz["id"]}  (#{biz.dig("currency", "code")})"
+    end
+
+    biz_id = ENV["WAVE_BUSINESS_ID"]
+    if biz_id && !biz_id.empty?
+      wave_with_biz = WaveClient.new(access_token: token, business_id: biz_id)
+      biz_name = businesses.find { |b| b["id"] == biz_id }&.dig("name") || biz_id
+
+      puts "\n=== Products / Services for #{biz_name} ==="
+      products = wave_with_biz.list_products
+      if products.any?
+        products.each do |p|
+          puts "  #{p["name"]} → WAVE_PRODUCT_ID=#{p["id"]}  (#{p["unitPrice"]})"
+        end
+      else
+        puts "  No products found. Create one in Wave first (e.g. 'Contractor Services')."
+      end
+
+      puts "\nSet WAVE_PRODUCT_ID in .env."
+    else
+      puts "\nSet WAVE_BUSINESS_ID in .env, then run setup again to see accounts."
+    end
+  end
+
+  desc "run_sync", "Sync paid invoices from Remote.com CSV export to Wave"
+  option :csv, type: :string, required: true, desc: "Path to Remote.com contractor invoices CSV export"
+  option :since, type: :string, desc: "Only sync invoices after this date (YYYY-MM-DD)"
+  option :dry_run, type: :boolean, default: false, desc: "Preview changes without creating anything"
+
+  def run_sync
+    validate_env!
+    validate_csv!
+
+    remote = RemoteClient.new(csv_path: options[:csv])
+
+    wave = WaveClient.new(
+      access_token: ENV.fetch("WAVE_ACCESS_TOKEN"),
+      business_id: ENV.fetch("WAVE_BUSINESS_ID")
+    )
+
+    product_id = ENV.fetch("WAVE_PRODUCT_ID")
+    syncer = Syncer.new(remote_client: remote, wave_client: wave, dry_run: options[:dry_run], product_id: product_id)
+
+    puts options[:dry_run] ? "=== DRY RUN MODE ===" : "=== Syncing invoices ==="
+    puts "CSV: #{options[:csv]}"
+    puts "Since: #{options[:since]}" if options[:since]
+    puts
+
+    syncer.sync(since: options[:since])
+  end
+
+  private
+
+  def validate_env!
+    required = %w[WAVE_ACCESS_TOKEN WAVE_BUSINESS_ID WAVE_PRODUCT_ID]
+    missing = required.select { |key| ENV[key].nil? || ENV[key].empty? }
+
+    return if missing.empty?
+
+    puts "Missing required environment variables:"
+    missing.each { |key| puts "  - #{key}" }
+    puts "\nCopy .env.example to .env and fill in your credentials."
+    exit 1
+  end
+
+  def validate_csv!
+    return if File.exist?(options[:csv])
+
+    puts "CSV file not found: #{options[:csv]}"
+    exit 1
+  end
+end
+
+CLI.start(ARGV)
