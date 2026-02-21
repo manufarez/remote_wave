@@ -74,6 +74,10 @@ bin/sync run_sync --csv contractor-invoices.csv --since 2026-01-01
 
 Go to Remote.com -> Contractor Invoices -> Export to download the CSV file -> Save it as `contractor-invoices.csv` in the root of the project.
 
+## Currency
+
+The CSV contains two amounts per invoice: the invoice amount (what the client was billed) and the payout amount (what you received). The script uses the **payout amount** since that's what hits your bank account and matches your Wave business currency.
+
 ## Duplicate prevention
 
 The script checks existing Wave invoices by invoice number before creating new ones. It's safe to run multiple times against the same CSV.
