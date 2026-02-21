@@ -18,7 +18,12 @@ For each paid invoice in the CSV, the script:
 
 - Ruby 3.x
 - A [Wave developer app](https://developer.waveapps.com) with an access token
-- Customers already created in Wave matching your Remote.com contractor names
+
+Make sure the following are created in Wave before running the script:
+
+- **Customers** matching your Remote.com contractor names (used for fuzzy matching)
+- **A bank account** (used as the anchor for payment transactions)
+- **A product/service** (used as the line item on invoices)
 
 ### Install dependencies
 

@@ -27,6 +27,7 @@ class Syncer
   def sync_invoice(invoice, results)
     name = invoice[:company_name]
     amount = invoice[:amount]
+    currency = invoice[:currency]
     date = invoice[:invoice_date]
     inv_num = invoice[:invoice_number]
 
@@ -38,18 +39,18 @@ class Syncer
     end
 
     if already_synced?(customer["id"], inv_num)
-      puts "  [SKIP] Already synced: ##{inv_num} - #{amount} EUR on #{date}"
+      puts "  [SKIP] Already synced: ##{inv_num} - #{amount} #{currency} on #{date}"
       results[:skipped] << { invoice: invoice, reason: "Already synced" }
       return
     end
 
     if @dry_run
-      puts "  [DRY RUN] Would sync: ##{inv_num} - #{amount} EUR on #{date}"
+      puts "  [DRY RUN] Would sync: ##{inv_num} - #{amount} #{currency} on #{date}"
       results[:synced] << invoice
       return
     end
 
-    label = "##{inv_num} #{name} - #{amount} EUR on #{date}"
+    label = "##{inv_num} #{name} - #{amount} #{currency} on #{date}"
 
     before_ids = @wave.receivable_account_ids
 
