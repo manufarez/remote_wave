@@ -1,3 +1,4 @@
 plan.md
 .env
 *.csv
+!test/fixtures/*.csv
