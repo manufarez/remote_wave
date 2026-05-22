@@ -20,7 +20,12 @@ class Reconciler
     warnings = []
     consumed = {}
 
-    csv_by_invoice = @csv_rows.each_with_object({}) { |r, h| h[r[:invoice_number]] = r }
+    eur_rows, non_eur_rows = @csv_rows.partition { |r| r[:currency] == "EUR" }
+    non_eur_rows.each do |row|
+      warnings << "Skipping CSV row ##{row[:invoice_number]}: payout currency is #{row[:currency]}, not EUR"
+    end
+
+    csv_by_invoice = eur_rows.each_with_object({}) { |r, h| h[r[:invoice_number]] = r }
 
     @revolut_topups.each do |topup|
       csv_row = csv_by_invoice[topup[:extracted_ref]]
@@ -39,7 +44,7 @@ class Reconciler
 
     pending = []
     missing = []
-    @csv_rows.each do |row|
+    eur_rows.each do |row|
       next if consumed[row[:invoice_number]]
 
       age = (@today - Date.parse(row[:invoice_date])).to_i

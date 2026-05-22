@@ -117,4 +117,22 @@ class ReconcilerTest < Minitest::Test
     assert_equal 1, result.missing.length
     assert_equal 141, result.missing.first[:age_in_days]
   end
+
+  def test_excludes_non_eur_csv_rows_and_records_a_warning
+    result = Reconciler.new(
+      csv_rows: [
+        csv_row(invoice_number: "26047103"),
+        csv_row(invoice_number: "26050200", currency: "USD")
+      ],
+      revolut_topups: [topup(reference: "26047103")],
+      today: Date.new(2026, 5, 22)
+    ).reconcile
+
+    assert_equal 1, result.matched.length
+    assert_empty result.pending
+    assert_empty result.missing
+    assert_equal 1, result.warnings.length
+    assert_match(/26050200/, result.warnings.first)
+    assert_match(/USD/, result.warnings.first)
+  end
 end
