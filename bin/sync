@@ -76,6 +76,7 @@ class CLI < Thor
   option :csv, type: :string, required: true, desc: "Path to Remote.com contractor invoices CSV export"
   option :since, type: :string, desc: "Only sync invoices after this date (YYYY-MM-DD)"
   option :dry_run, type: :boolean, default: false, desc: "Preview changes without creating anything"
+  option :revolut_csv, type: :string, desc: "If provided, also run reconciliation against this Revolut statement CSV after sync"
 
   def run_sync
     validate_env!
@@ -98,6 +99,24 @@ class CLI < Thor
     puts
 
     syncer.sync(since: options[:since])
+
+    return unless options[:revolut_csv]
+
+    validate_file!(options[:revolut_csv], "Revolut statement CSV")
+
+    csv_rows = remote.paid_invoices(since: options[:since])
+    topups = RevolutStatement.new(csv_path: options[:revolut_csv]).remote_topups(since: options[:since])
+    result = Reconciler.new(csv_rows: csv_rows, revolut_topups: topups).reconcile
+
+    puts
+    print_reconciliation_report(
+      csv_path: options[:csv],
+      statement_path: options[:revolut_csv],
+      since: options[:since],
+      csv_rows: csv_rows,
+      topups: topups,
+      result: result
+    )
   end
 
   desc "reconcile", "Compare Remote.com CSV paid_out rows against a Revolut Business statement CSV"
