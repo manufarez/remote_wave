@@ -8,6 +8,8 @@ require "thor"
 require_relative "../lib/remote_client"
 require_relative "../lib/wave_client"
 require_relative "../lib/syncer"
+require_relative "../lib/revolut_statement"
+require_relative "../lib/reconciler"
 
 class CLI < Thor
   default_command :run_sync
@@ -98,7 +100,87 @@ class CLI < Thor
     syncer.sync(since: options[:since])
   end
 
+  desc "reconcile", "Compare Remote.com CSV paid_out rows against a Revolut Business statement CSV"
+  option :csv, type: :string, required: true, desc: "Path to Remote.com contractor invoices CSV"
+  option :revolut_csv, type: :string, required: true, desc: "Path to Revolut Business statement CSV"
+  option :since, type: :string, desc: "Only include rows on or after this date (YYYY-MM-DD)"
+
+  def reconcile
+    validate_file!(options[:csv], "CSV")
+    validate_file!(options[:revolut_csv], "Revolut statement CSV")
+
+    csv_rows = RemoteClient.new(csv_path: options[:csv]).paid_invoices(since: options[:since])
+    topups = RevolutStatement.new(csv_path: options[:revolut_csv]).remote_topups(since: options[:since])
+    result = Reconciler.new(csv_rows: csv_rows, revolut_topups: topups).reconcile
+
+    print_reconciliation_report(
+      csv_path: options[:csv],
+      statement_path: options[:revolut_csv],
+      since: options[:since],
+      csv_rows: csv_rows,
+      topups: topups,
+      result: result
+    )
+  end
+
   private
+
+  def validate_file!(path, label)
+    return if File.exist?(path)
+    puts "#{label} not found: #{path}"
+    exit 1
+  end
+
+  def print_reconciliation_report(csv_path:, statement_path:, since:, csv_rows:, topups:, result:)
+    puts "=== Reconciliation (CSV <-> Revolut statement) ==="
+    puts "CSV file:     #{csv_path}"
+    puts "Statement:    #{statement_path}"
+    puts "Since:        #{since}" if since
+    puts "CSV paid_out: #{csv_rows.length}"
+    puts "Remote TOPUPs in statement: #{topups.length}"
+    puts
+
+    result.warnings.each { |w| puts "[WARN] #{w}" }
+    puts unless result.warnings.empty?
+
+    print_bucket("[OK]      Matched", result.matched) do |entry|
+      "  #{entry[:csv_row][:invoice_number]}  #{entry[:csv_row][:invoice_date]}  EUR #{format("%.2f", entry[:csv_row][:amount])}"
+    end
+
+    print_bucket("[WARN]    Amount mismatch", result.amount_mismatch) do |entry|
+      csv = entry[:csv_row]
+      tx = entry[:revolut_topup]
+      "  ##{csv[:invoice_number]}  CSV: #{format("%.2f", csv[:amount])} #{csv[:currency]}  Revolut: #{format("%.2f", tx[:amount])} #{tx[:currency]}"
+    end
+
+    print_bucket("[PENDING] Money not landed yet", result.pending) do |entry|
+      csv = entry[:csv_row]
+      "  ##{csv[:invoice_number]}  #{csv[:invoice_date]}  expected EUR #{format("%.2f", csv[:amount])}  (#{entry[:age_in_days]} days old)"
+    end
+
+    print_bucket("[MISSING] Should have landed", result.missing) do |entry|
+      csv = entry[:csv_row]
+      "  ##{csv[:invoice_number]}  #{csv[:invoice_date]}  expected EUR #{format("%.2f", csv[:amount])}  (#{entry[:age_in_days]} days old)"
+    end
+
+    print_bucket("[?]       Unaccounted Revolut deposits", result.unaccounted) do |entry|
+      tx = entry[:revolut_topup]
+      "  Ref #{tx[:reference].inspect}  #{tx[:completed_at]}  EUR #{format("%.2f", tx[:amount])}"
+    end
+
+    puts "\nSummary: #{result.matched.length} matched, " \
+         "#{result.amount_mismatch.length} mismatches, " \
+         "#{result.pending.length} pending, " \
+         "#{result.missing.length} missing, " \
+         "#{result.unaccounted.length} unaccounted"
+  end
+
+  def print_bucket(label, entries)
+    puts "#{label} (#{entries.length})"
+    entries.first(20).each { |e| puts yield(e) }
+    puts "  (... #{entries.length - 20} more)" if entries.length > 20
+    puts
+  end
 
   def validate_env!
     required = %w[WAVE_ACCESS_TOKEN WAVE_BUSINESS_ID WAVE_ANCHOR_ACCOUNT_ID WAVE_PRODUCT_ID]
