@@ -81,3 +81,42 @@ The CSV contains two amounts per invoice: the invoice amount (what the client wa
 ## Duplicate prevention
 
 The script checks existing Wave invoices by invoice number before creating new ones. It's safe to run multiple times against the same CSV.
+
+## Reconciliation against Revolut
+
+Verify that the money for `paid_out` invoices actually landed in your Revolut Business EUR account.
+
+### Export a Revolut statement
+
+1. In the Revolut Business app or web: **Accounts → EUR Main → Statement**.
+2. Pick a date range that covers your invoices (going back at least 2x the longest payout lag).
+3. Download as **CSV** (not PDF).
+4. Save into the project root — any filename, but the `transaction-statement_*.csv` pattern is what Revolut uses by default.
+
+### Run reconciliation
+
+Standalone:
+
+```
+bin/sync reconcile --csv contractor-invoices.csv --revolut-csv transaction-statement_<dates>.csv
+```
+
+Or as part of the sync:
+
+```
+bin/sync run_sync --csv contractor-invoices.csv --revolut-csv transaction-statement_<dates>.csv
+```
+
+Both commands accept `--since YYYY-MM-DD` to restrict the window.
+
+### What the report shows
+
+Five buckets:
+
+- `[OK]` **Matched** — Revolut deposit's reference matches a CSV `paid_out` row, amounts agree to the cent.
+- `[WARN]` **Amount mismatch** — Reference matches but amount or currency differs.
+- `[PENDING]` **Money not landed yet** — CSV row with no matching deposit, less than 60 days old.
+- `[MISSING]` **Should have landed** — CSV row with no matching deposit, 60+ days old. Worth investigating.
+- `[?]` **Unaccounted Revolut deposits** — Deposit from Remote whose reference doesn't appear in the CSV (likely an invoice not in the latest CSV export).
+
+The CLI only matches deposits whose Revolut `Description` contains `REMOTE TECHNOLOGY`. Payments from other clients are silently ignored.
