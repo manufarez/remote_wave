@@ -29,4 +29,14 @@ class RevolutStatementTest < Minitest::Test
     assert_equal "Invoice 26021797", prefixed[:reference]
     assert_equal "26021797", prefixed[:extracted_ref]
   end
+
+  def test_since_excludes_topups_before_the_cutoff
+    rows = RevolutStatement.new(csv_path: FIXTURE).remote_topups(since: "2026-05-01")
+    assert_equal %w[tx-1], rows.map { |r| r[:id] }
+  end
+
+  def test_since_is_inclusive_of_the_cutoff_date
+    rows = RevolutStatement.new(csv_path: FIXTURE).remote_topups(since: "2026-05-04")
+    assert_includes rows.map { |r| r[:id] }, "tx-1"
+  end
 end
