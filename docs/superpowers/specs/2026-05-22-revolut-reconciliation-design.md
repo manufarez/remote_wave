@@ -157,7 +157,7 @@ CSV file:     contractor-invoices.csv
 Statement:    transaction-statement_01-May-2024_22-May-2026.csv
 Window:       2024-05-01 → 2026-05-22
 CSV paid_out: 100
-Remote TOPUPs in statement: 100
+Remote TOPUPs in statement: 97
 
 [OK]      Matched (97)
 [WARN]    Amount mismatch (0)
