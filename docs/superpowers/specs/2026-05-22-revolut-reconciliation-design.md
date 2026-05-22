@@ -1,12 +1,12 @@
 # Revolut Reconciliation — Design
 
 **Date:** 2026-05-22
-**Status:** Approved by user, pending implementation plan
+**Status:** Revised — switched data source from Revolut Business API to manual statement CSV export. Pending user re-approval.
 **Project:** remote_wave
 
 ## Problem
 
-The current CLI (`bin/sync run_sync`) reads paid invoices from a Remote.com CSV export, creates matching invoices in Wave, and records them as paid. This trusts Remote's CSV: if Remote reports an invoice as `paid_out`, Wave is updated accordingly. The user has no automated way to confirm that the money for those `paid_out` invoices actually landed in their Revolut Business EUR account.
+The current CLI (`bin/sync run_sync`) reads paid invoices from a Remote.com CSV export, creates matching invoices in Wave, and records them as paid. It trusts Remote's CSV: if Remote reports an invoice as `paid_out`, Wave is updated accordingly. The user has no automated way to confirm that the money for those `paid_out` invoices actually landed in their Revolut Business EUR account.
 
 We want to add a reconciliation step that compares Remote.com CSV `paid_out` rows against actual incoming Revolut deposits and reports the discrepancies, without making any changes to Wave or Revolut.
 
@@ -16,156 +16,178 @@ A pure reporting feature: at the end of a sync (or as a standalone command), pri
 - Invoices the user expected to be paid for and were
 - Invoices where the money has not yet landed
 - Invoices that should have landed by now but haven't
-- Deposits that landed but don't correspond to any CSV row
+- Deposits that landed from Remote but don't correspond to any CSV row
 
 ## Non-goals
 
 - No writes to Wave or Revolut.
-- No webhook listener — CLI poll only.
-- No persistent cache of Revolut transactions; refetch each run within the window.
-- No multi-currency reconciliation. EUR payouts only. (All current CSV `paid_out` rows are EUR; if a non-EUR payout ever appears, reconciliation should skip it and surface a warning rather than try to handle FX.)
+- No Revolut Business API integration. (The Revolut API requires the €30/month Grow plan, which is not justified for this use case. The Revolut statement CSV download contains the same fields we'd consume via the API.)
+- No multi-currency reconciliation. EUR payouts only. (All current CSV `paid_out` rows are EUR; a non-EUR Remote payout, if it ever appeared, should be skipped with a warning.)
+- No reconciliation of deposits from clients *other than* Remote. The user has other direct clients (Mamiche SAS, Marie Hazard, etc.) whose payments also land in Revolut; those are explicitly out of scope because the Remote CSV doesn't claim to know about them. They must not appear in the report at all (not even in the "unaccounted" bucket), or the report will be noisy.
 - No retroactive payment recording in Wave when reconciliation detects a missed deposit.
-- No support for matching against payouts that bundle multiple invoices into a single transfer — the observed pattern is one invoice per deposit (confirmed below).
+- No support for payouts that bundle multiple invoices into a single transfer. Confirmed below: Remote sends one transfer per invoice.
 
 ## Background — observed data
 
-From parsing the existing `contractor-invoices.csv` (100 `paid_out` rows) and a sample Revolut transaction screenshot:
+### Remote.com CSV (`contractor-invoices.csv`)
 
-- The CSV contains both `Invoice amount` (USD, since the user invoices in USD) and `Payout amount` (EUR, since the Revolut account is EUR). Remote performs the FX conversion before transferring.
-- The CSV has only an `Issued date`, not a payout date. Observed lag from issue to deposit is around 27 days in the sampled transaction; the user reports lags of up to a month or more due to Remote's validation cycle.
-- Many CSV `Payout amount` values repeat across the history (e.g. €552.66 appears 4 times within a 4-week span), so amount alone is not a unique key.
-- All `paid_out` rows so far come from a single client (`Pinpoint Dining, Inc`), and all payouts are EUR.
-- Revolut shows incoming Remote transfers with:
-  - `from`: `REMOTE TECHNOLOGY SERVICES, INC`
-  - `reference`: a numeric string equal to the CSV `Invoice Number` (verified: Revolut reference `26047103` matched CSV row `26047103` with payout €541.51 on Apr 7, 2026)
-  - `amount`: exactly equal to the CSV `Payout amount` (no fees on receipt)
-  - `fees`: `No fee`
+100 `paid_out` rows in the sample, all from a single client (`Pinpoint Dining, Inc`), all in EUR. Contains both `Invoice amount` (USD, since the user invoices in USD) and `Payout amount` (EUR, since the Revolut account is EUR). Remote performs the FX conversion before transferring. The CSV has only `Issued date`, not a payout date. Observed lag from issue to deposit is up to ~30 days due to Remote's validation cycle.
 
-This makes the Revolut `reference` field a deterministic join key onto CSV `Invoice Number`.
+Many CSV `Payout amount` values repeat across the history (e.g. €552.66 appears 4 times within a 4-week span), so amount alone is not a unique key.
+
+### Revolut statement CSV (e.g. `transaction-statement_01-May-2024_22-May-2026.csv`)
+
+Downloaded manually from Revolut Business (Accounts → EUR Main → Statement → CSV/Excel). Columns of interest:
+
+| Column | Use |
+|---|---|
+| `Type` | Filter: keep only `TOPUP` (incoming wire transfers) |
+| `State` | Filter: keep only `COMPLETED` |
+| `Description` | Filter: keep only rows containing `REMOTE TECHNOLOGY` (excludes other-client TOPUPs) |
+| `Reference` | Join key: contains the Remote invoice number, possibly with surrounding text |
+| `Amount` | Verification: must match CSV `Payout amount` to the cent |
+| `Payment currency` | Verification: must equal `EUR` |
+| `Date completed (UTC)` | Used for `age_in_days` calculation and pending/missing classification |
+
+Verified against the user's real statement: **100 of 100** paid_out CSV rows match a Remote TOPUP in the statement when the join is performed correctly. The other 11 TOPUPs in the statement come from non-Remote clients and are correctly filtered out by the `Description` check.
+
+The `Payer` column is always `nil` for TOPUPs — do not rely on it. Sender identification must come from `Description`.
+
+### Reference field variability
+
+For Remote TOPUPs in the sampled statement, `Reference` is always a bare invoice number string (e.g. `"26047103"`). However, other clients' TOPUPs show formats like `"Invoice 26021797"`, `"/RFB/505828174//WEB DEVELOPMENT POP SERVICES"`, or `"solde honoraires"` — so a future Remote change to prefix the reference is plausible.
+
+To stay robust against that, the match rule extracts the longest contiguous digit run from `Reference` and compares it to CSV `Invoice Number` as strings. For the current sample this is equivalent to exact equality.
 
 ## Match strategy
 
-**Primary:** for each Revolut incoming transfer from Remote, look up its `reference` string in the CSV indexed by `Invoice Number`. String equality.
+For each Revolut row that survives the filters (`Type=TOPUP`, `State=COMPLETED`, `Description` contains `REMOTE TECHNOLOGY`):
 
-**Verification:** when a reference matches, also compare `amount` to the cent and `currency`. If they disagree, classify the row as a mismatch (rather than as a clean match) so the user investigates.
+1. Extract the longest digit run from `Reference`. Call it `extracted_ref`.
+2. Look up `extracted_ref` in the CSV indexed by `Invoice Number` (string equality).
+3. If found, compare `Amount` to the cent and `Payment currency` to `EUR`. If both agree, classify as `matched`; if either disagrees, classify as `amount_mismatch`.
+4. If not found, classify as `unaccounted` (a deposit from Remote with a reference that doesn't map to any CSV row — likely an invoice not yet in the export).
 
-**No chronological greedy fallback** is included. If a reference is missing or doesn't map to any CSV row, the deposit is reported in the "unaccounted" bucket so the user can decide what to do. This trades some auto-resolution for simplicity and avoids the risk of mis-pairing duplicate amounts.
+For each CSV `paid_out` row that does not get claimed by any Revolut row:
+- If `Issued date` is less than 60 days before the run date → `pending`
+- Otherwise → `missing`
+
+No chronological greedy fallback. References have proven reliable enough that adding fallback logic would only obscure real problems.
 
 ## Buckets in the report
 
-Each row of input ends up in exactly one bucket:
-
 | Bucket | Definition |
 |---|---|
-| `matched` | Revolut deposit's reference matches a CSV `paid_out` row's `Invoice Number`, and EUR amounts agree to the cent |
-| `amount_mismatch` | Reference matches but amounts differ |
-| `pending` | CSV `paid_out` row has no matching Revolut deposit, and `Issued date` is less than 60 days before the reconciliation run date |
-| `missing` | CSV `paid_out` row has no matching Revolut deposit, and `Issued date` is 60 or more days before the run date |
-| `unaccounted` | Revolut incoming deposit from Remote with a reference that does not appear in the CSV |
+| `matched` | Filtered Revolut TOPUP's `extracted_ref` matches a CSV `paid_out` row's `Invoice Number`, and EUR amounts agree to the cent |
+| `amount_mismatch` | `extracted_ref` matches, but amount or currency differs |
+| `pending` | CSV `paid_out` row not claimed by any Revolut row, and `Issued date` is less than 60 days before run date |
+| `missing` | CSV `paid_out` row not claimed by any Revolut row, and `Issued date` is 60+ days before run date |
+| `unaccounted` | Filtered Revolut TOPUP whose `extracted_ref` doesn't appear in the CSV |
 
-The 60-day cutoff between `pending` and `missing` is a heuristic: the observed worst-case lag is ~30 days, so 60 days is a 2x safety margin. It is hard-coded for v1; not exposed as a flag.
+The 60-day cutoff is a hard-coded constant in `Reconciler` (named, not magic). The observed worst-case lag is ~30 days, so 60 is a 2x safety margin.
 
-CSV rows with status other than `paid_out` (e.g. `issued`, `rejected`) are not part of reconciliation input. Revolut transactions whose counterparty does not look like Remote are filtered out before bucketing.
+CSV rows whose status is not `paid_out` are not part of input. Revolut rows that fail the type/state/description filter are not part of input — they are silently ignored, not bucketed.
 
 ## CLI surface
 
-- New standalone command: `bin/sync reconcile --csv <path> [--since YYYY-MM-DD]`
-  - `--csv` is required, same semantics as `run_sync`.
-  - `--since` filters the CSV rows considered and is also passed to the Revolut transaction fetch as the lower bound. If omitted, the lower bound is the oldest `Issued date` in the CSV, minus a small buffer.
-  - The upper bound for Revolut fetch is always "now".
-- New flag on `run_sync`: `--skip-reconcile` (default false). When `run_sync` finishes, it invokes the reconciler with the same CSV and `--since` arguments and prints the report. `--skip-reconcile` opts out.
-- A new helper: `bin/sync revolut_setup` (mirrors the existing `setup` command). Walks through Revolut's OAuth flow once, prints the refresh token to paste into `.env`, and lists the available Revolut Business accounts so the user can pick the EUR account ID. Does not write to `.env` itself.
+- New standalone command: `bin/sync reconcile --csv <path> --revolut-csv <path> [--since YYYY-MM-DD]`
+  - `--csv` is required (same semantics as `run_sync`).
+  - `--revolut-csv` is required.
+  - `--since` filters both inputs by date and is also used as the lower bound for the report window.
+- New flag on `run_sync`: `--revolut-csv <path>`. When provided, `run_sync` invokes the reconciler after the Wave sync completes and prints the report. When omitted, no reconciliation is attempted (no warning, no error — opt-in via the flag).
+- No `revolut_setup` helper (no API auth needed).
 
 ## Architecture
 
 Three new files, mirroring the existing layout:
 
-### `lib/revolut_client.rb`
+### `lib/revolut_statement.rb`
 
-Wraps the Revolut Business API.
+Pure CSV parser. Mirrors the shape of `RemoteClient`.
 
-- Auth: OAuth 2.0 with JWT client assertion. Public X.509 cert uploaded once via the Revolut Business UI (the user has already paid for API access and seen the upload prompt). Private key + client ID + long-lived refresh token live in `.env`. The client exchanges the refresh token for a short-lived access token on each run (or per request, if simpler), caching it in memory for the process lifetime.
-- Base URL: production `https://b2b.revolut.com/api/1.0`. Sandbox URL is overridable via `REVOLUT_BASE_URL` for testing.
-- Methods needed for v1:
-  - `accounts` — list accounts (used by `revolut_setup`)
-  - `transactions(from:, to:, type: "topup", account_id: nil, count: 1000)` — list incoming transactions in a window. Handles pagination (Revolut paginates by `from`/`to` cursors or by `count`; the client wraps that).
-- Returns plain Hashes with normalized keys: `id`, `reference`, `amount` (Float, EUR), `currency`, `date` (Date), `counterparty_name`.
-- Errors raise `RevolutClient::Error` with the response body for easy debugging.
+- Constructor: `RevolutStatement.new(csv_path:)`
+- Single public method: `#remote_topups(since: nil)` — returns an array of normalized hashes:
+  ```
+  {
+    id: "<Revolut transaction ID>",
+    reference: "<raw Reference string>",
+    extracted_ref: "<longest digit run from Reference, or nil>",
+    amount: 541.51,         # Float, always positive (TOPUPs have positive Amount in Revolut export)
+    currency: "EUR",
+    completed_at: Date,
+    description: "<full Description string>"
+  }
+  ```
+- Internally filters to `Type == "TOPUP"`, `State == "COMPLETED"`, `Description` matches `/REMOTE TECHNOLOGY/i`. Filtering happens here so the `Reconciler` only sees relevant rows.
+- Optionally filters by `since` (using `Date completed (UTC)`).
 
 ### `lib/reconciler.rb`
 
 Pure logic. No I/O.
 
-- Constructor: `Reconciler.new(csv_rows:, revolut_transactions:, today: Date.today)`
-- Single public method: `#reconcile` returns a `Result` struct (or plain Hash) with the five buckets, each an Array of small Hashes containing the originating CSV row, the originating Revolut transaction, and any computed metadata (e.g. `age_in_days` for `pending`/`missing`).
-- Easy to test: feed it arrays of stub data, assert bucket membership.
+- Constructor: `Reconciler.new(csv_rows:, revolut_topups:, today: Date.today)`
+  - `csv_rows` are the hashes already returned by `RemoteClient#paid_invoices` — same shape, no transformation.
+  - `revolut_topups` are the hashes returned by `RevolutStatement#remote_topups`.
+- Single public method: `#reconcile` — returns a `Result` struct with the five bucket arrays. Each entry includes the originating row(s) and any computed metadata (`age_in_days` for `pending`/`missing`).
+- One named constant: `PENDING_CUTOFF_DAYS = 60`.
 
-### `bin/sync reconcile` (in existing `bin/sync` Thor CLI)
+### `bin/sync reconcile` (added to existing `bin/sync` Thor CLI)
 
-- Wires the CSV reader (existing `RemoteClient`) and `RevolutClient` together, runs `Reconciler`, then pretty-prints the result.
-- Pretty-printer is its own small private method in `bin/sync` — no need for a separate class.
-- Exit code is `0` if the report ran successfully, regardless of whether mismatches were found. (Mismatches are a normal output, not an error.)
+- Wires `RemoteClient` + `RevolutStatement` + `Reconciler` together, then pretty-prints the result.
+- The printer is a private method in `bin/sync` (small enough not to warrant its own class).
+- Exit code is always `0` on success, regardless of mismatches. Mismatches are normal output, not errors.
 
 ### Integration with `run_sync`
 
-After `Syncer#sync` completes, `run_sync` builds a `Reconciler` from the same CSV and the freshly-fetched Revolut transactions, then prints the report — unless `--skip-reconcile` was passed.
+When `run_sync` is invoked with `--revolut-csv`, it runs the reconciler after `Syncer#sync` returns and prints the report. Without the flag, behavior is unchanged.
 
 ## Configuration
 
-New env vars added to `.env.example`:
+No new env vars. The Revolut statement CSV path is passed via the CLI flag, not the environment, because the file changes each time the user re-exports.
 
-```
-REVOLUT_CLIENT_ID=...
-REVOLUT_PRIVATE_KEY_PATH=./revolut_private.pem
-REVOLUT_REFRESH_TOKEN=...
-REVOLUT_ACCOUNT_ID=...           # EUR account ID, from `revolut_setup`
-# REVOLUT_BASE_URL=https://sandbox-b2b.revolut.com/api/1.0   # optional sandbox override
-```
-
-`REVOLUT_PRIVATE_KEY_PATH` points to a PEM file that should be gitignored alongside `.env`. The setup README will tell the user to add `*.pem` to `.gitignore`.
-
-When the reconcile command runs, missing Revolut env vars yield a clear error pointing the user at `bin/sync revolut_setup` and the README.
+Add `transaction-statement_*.csv` to `.gitignore` to keep statements out of git.
 
 ## Output format
 
-Plain text, grouped by bucket. Empty buckets are still printed (with `(0)`) so the user sees at a glance that every bucket was checked. Example:
+Plain text, grouped by bucket. Empty buckets are still printed (with `(0)`) so the user sees at a glance that every bucket was checked. ASCII markers (no emojis) — matches the user's preference. Example:
 
 ```
-=== Reconciliation (CSV ↔ Revolut) ===
-Window: 2024-05-01 → 2026-05-22
-CSV paid_out rows: 100
-Revolut Remote deposits: 99
+=== Reconciliation (CSV ↔ Revolut statement) ===
+CSV file:     contractor-invoices.csv
+Statement:    transaction-statement_01-May-2024_22-May-2026.csv
+Window:       2024-05-01 → 2026-05-22
+CSV paid_out: 100
+Remote TOPUPs in statement: 100
 
-✅ Matched (97)
-⚠️  Amount mismatch (0)
-⏳ Pending — money not landed yet (2)
-   26052101  Apr 28, 2026  expected €533.08
-   26051402  Apr 14, 2026  expected €530.00
-❌ Missing — should have landed (1)
-   26039201  Feb 14, 2026  expected €548.13  (97 days ago)
-❓ Unaccounted Revolut deposits (0)
+[OK]      Matched (97)
+[WARN]    Amount mismatch (0)
+[PENDING] Money not landed yet (2)
+            26052101  Apr 28, 2026  expected €533.08
+            26051402  Apr 14, 2026  expected €530.00
+[MISSING] Should have landed (1)
+            26039201  Feb 14, 2026  expected €548.13  (97 days old)
+[?]       Unaccounted Revolut deposits (0)
 
 Summary: 97 matched, 0 mismatches, 2 pending, 1 missing, 0 unaccounted
 ```
 
-If a bucket has more than ~20 entries, truncate the printed list to the first 20 and print `(… 18 more, run with --verbose for full list)`. A `--verbose` flag on `reconcile` shows the full list. (The `--verbose` flag is the only stretch nicety; if it complicates implementation, omit it for v1 and just always print all rows.)
+If a bucket has more than 20 entries, print the first 20 and append `(… N more)`. No `--verbose` flag in v1.
 
 ## Error handling
 
-- Revolut auth failure (invalid refresh token, expired cert): raise with a clear message pointing the user at `revolut_setup`. Do not silently fall back.
-- Revolut API transient error (5xx, network): retry once with a short backoff, then surface the error. Reconciliation is read-only and safe to retry.
-- CSV row with an invalid `Issued date` format: surface the row in a warning before bucketing, do not crash.
-- Run started without any Revolut transactions returned: print the report normally (everything ends up in `pending` or `missing`); do not assume an error.
-- `run_sync` with `--skip-reconcile` omitted, but Revolut env vars missing: print a one-line warning and skip the reconciliation step; do not block the sync from completing.
+- Missing Revolut CSV file → exit 1 with a clear message.
+- Revolut CSV is structurally invalid (missing required columns) → raise with a list of the missing columns.
+- CSV row with an unparseable date → print a warning, skip the row, continue.
+- Empty Revolut statement → print the report normally (everything ends up in `pending` or `missing`).
+- A `paid_out` CSV row whose `Payout amount currency` is not EUR → print a warning and exclude from reconciliation; do not silently treat it as matched.
 
 ## Testing
 
-- Unit tests for `Reconciler` covering all five bucket transitions, plus the `pending`/`missing` boundary at exactly 60 days.
-- Unit tests for `RevolutClient`'s response normalization using stubbed HTTP (WebMock or similar) — at minimum, one success fixture and one error fixture per method.
-- Manual end-to-end verification once against the user's real CSV and real Revolut account, with a dry-run-equivalent: since reconcile is read-only, the manual run itself is the verification.
+- Unit tests for `Reconciler` covering all five bucket transitions, plus the `pending`/`missing` boundary at exactly 60 days, plus the EUR-currency-mismatch warning path.
+- Unit tests for `RevolutStatement` covering: the type/state/description filter, reference-digit extraction (bare digits, prefixed text, no-digits-at-all, embedded amongst other text), and `since` filtering.
+- A fixture-based test using a sanitized snippet of the real statement CSV (3–4 rows covering: a clean Remote TOPUP, a non-Remote TOPUP that must be filtered, a card payment that must be filtered, and a refund/EXCHANGE that must be filtered).
+- Manual end-to-end run against the user's real CSV + statement once — since reconciliation is read-only, the manual run is itself the verification.
 
-## Open items deferred to implementation
+## Future possibility (not in v1)
 
-- Exact Revolut transactions endpoint shape and pagination details — to be confirmed against Revolut's Business API docs during implementation.
-- Whether `RevolutClient` should accept the private key as PEM contents (env var) or as a file path. File path is the current plan; revisit if it's awkward.
-- Whether `revolut_setup` should be fully automated (browser redirect handling) or print URLs for the user to paste codes back. Print-and-paste is the current plan for simplicity.
+If the user later upgrades to the Revolut Grow plan ($30/mo), the data source can swap to a `RevolutClient` API wrapper with the same `#remote_topups` interface, and `Reconciler` plus the CLI surface won't change. The CSV approach is fully sufficient until then.
