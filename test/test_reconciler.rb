@@ -47,4 +47,74 @@ class ReconcilerTest < Minitest::Test
     assert_empty result.unaccounted
     assert_empty result.warnings
   end
+
+  def test_classifies_as_amount_mismatch_when_amounts_differ
+    result = Reconciler.new(
+      csv_rows: [csv_row(invoice_number: "26047103", amount: 541.51)],
+      revolut_topups: [topup(reference: "26047103", amount: 540.00)],
+      today: Date.new(2026, 5, 22)
+    ).reconcile
+
+    assert_empty result.matched
+    assert_equal 1, result.amount_mismatch.length
+  end
+
+  def test_classifies_as_amount_mismatch_when_currency_differs
+    result = Reconciler.new(
+      csv_rows: [csv_row(invoice_number: "26047103", amount: 541.51, currency: "EUR")],
+      revolut_topups: [topup(reference: "26047103", amount: 541.51, currency: "USD")],
+      today: Date.new(2026, 5, 22)
+    ).reconcile
+
+    assert_empty result.matched
+    assert_equal 1, result.amount_mismatch.length
+  end
+
+  def test_classifies_topup_with_unknown_reference_as_unaccounted
+    result = Reconciler.new(
+      csv_rows: [csv_row(invoice_number: "26047103")],
+      revolut_topups: [topup(reference: "99999999")],
+      today: Date.new(2026, 5, 22)
+    ).reconcile
+
+    assert_empty result.matched
+    assert_equal 1, result.unaccounted.length
+    assert_equal "99999999", result.unaccounted.first[:revolut_topup][:extracted_ref]
+  end
+
+  def test_classifies_unmatched_csv_row_as_pending_when_under_cutoff
+    result = Reconciler.new(
+      csv_rows: [csv_row(invoice_number: "26047103", issued_date: "2026-04-01")],
+      revolut_topups: [],
+      today: Date.new(2026, 5, 22)
+    ).reconcile
+
+    assert_equal 1, result.pending.length
+    assert_equal 51, result.pending.first[:age_in_days]
+    assert_empty result.missing
+  end
+
+  def test_classifies_unmatched_csv_row_as_missing_when_at_cutoff
+    result = Reconciler.new(
+      csv_rows: [csv_row(invoice_number: "26047103", issued_date: "2026-03-23")],
+      revolut_topups: [],
+      today: Date.new(2026, 5, 22)
+    ).reconcile
+
+    assert_empty result.pending
+    assert_equal 1, result.missing.length
+    assert_equal 60, result.missing.first[:age_in_days]
+  end
+
+  def test_classifies_unmatched_csv_row_as_missing_when_well_past_cutoff
+    result = Reconciler.new(
+      csv_rows: [csv_row(invoice_number: "26047103", issued_date: "2026-01-01")],
+      revolut_topups: [],
+      today: Date.new(2026, 5, 22)
+    ).reconcile
+
+    assert_empty result.pending
+    assert_equal 1, result.missing.length
+    assert_equal 141, result.missing.first[:age_in_days]
+  end
 end
